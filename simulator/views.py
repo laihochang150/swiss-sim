@@ -6,6 +6,10 @@ from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
+TEAM_COUNT = 16
+WEAK_TEAM_START = 9  # 1-based team id
+BATCH_RUNS = 10000
+
 def index(request):
     return render(request, 'index.html')
 
@@ -165,15 +169,88 @@ def run_single_simulation(win_rates, team_names=None, regions=None):
     qualifiers = [i + 1 for i, t in enumerate(teams) if t['wins'] == 3]
     return {'rounds': rounds_log, 'qualifiers': sorted(qualifiers)}
 
-def run_multi_simulation(win_rates, team_names=None, regions=None, n=10000):
+def run_single_group_simulation(win_rates, team_names=None, regions=None, group_count=4):
+    # One 16-team group stage.
+    if team_names is None:
+        team_names = [str(i + 1) for i in range(TEAM_COUNT)]
+    if regions is None:
+        regions = list(range(1, TEAM_COUNT + 1))
+    if group_count not in (1, 2, 4, 8):
+        group_count = 4
+    group_size = TEAM_COUNT // group_count
+    shuffled = list(range(TEAM_COUNT))
+    random.shuffle(shuffled)
+    drawn_groups = [shuffled[i:i + group_size] for i in range(0, TEAM_COUNT, group_size)]
+    group_logs = []
+    qualifiers = []
+    for group_idx, team_ids in enumerate(drawn_groups):
+        wins = {team_id: 0 for team_id in team_ids}
+        losses = {team_id: 0 for team_id in team_ids}
+        matches = []
+
+        for i in range(len(team_ids)):
+            for j in range(i + 1, len(team_ids)):
+                team1_id = team_ids[i]
+                team2_id = team_ids[j]
+                winner, games = simulate_match(
+                    team1_id,
+                    team2_id,
+                    win_rates[team1_id][team2_id],
+                    is_bo3=False,
+                )
+                loser = team2_id if winner == team1_id else team1_id
+                wins[winner] += 1
+                losses[loser] += 1
+                matches.append({
+                    'team1': team1_id + 1,
+                    'team2': team2_id + 1,
+                    'team1_name': team_names[team1_id],
+                    'team2_name': team_names[team2_id],
+                    'winner': winner + 1,
+                    'winner_name': team_names[winner],
+                    'games': [g + 1 for g in games],
+                    'bo3': False,
+                    'violation': None,
+                })
+        ranked_ids = sorted(team_ids, key=lambda team_id: (-wins[team_id], team_id))
+        qualified_ids = ranked_ids[:2]
+        qualifiers.extend(qualified_ids)
+
+        standings = []
+        for rank, team_id in enumerate(ranked_ids, 1):
+            standings.append({
+                'rank': rank,
+                'team': team_id + 1,
+                'name': team_names[team_id],
+                'wins': wins[team_id],
+                'losses': losses[team_id],
+                'qualified': team_id in qualified_ids,
+            })
+
+        group_logs.append({
+            'group_name': "Group " + str(group_idx + 1),
+            'teams': [team_id + 1 for team_id in team_ids],
+            'standings': standings,
+            'matches': matches,
+        })
+
+    qualifier_ids = sorted(team_id + 1 for team_id in qualifiers)
+    return {
+        'format': 'group',
+        'groups': group_logs,
+        'qualifiers': qualifier_ids,
+        'weak_count': sum(1 for team_id in qualifier_ids if team_id >= WEAK_TEAM_START),
+    }
+
+def _aggregate_multi(runner, win_rates, team_names=None, regions=None, n=BATCH_RUNS):
     count = [0] * 16
     weak_count_freq = defaultdict(int)  # key: number of teams from 9-16 in qualifiers
 
     for _ in range(n):
-        result = run_single_simulation(win_rates, team_names, regions)
+        result = runner(win_rates, team_names, regions)
         qualifiers = result['qualifiers']
         # Count how many are in 9-16 (i.e., id >= 9)
-        weak_count = sum(1 for q in qualifiers if q >= 9)
+        weak_count = sum(1 for q in qualifiers if q >= WEAK_TEAM_START)
         weak_count_freq[weak_count] += 1
         for q in qualifiers:
             count[q - 1] += 1
@@ -181,6 +258,15 @@ def run_multi_simulation(win_rates, team_names=None, regions=None, n=10000):
     # Convert to list of length 9 (0 to 8)
     weak_freq_list = [weak_count_freq[i] for i in range(9)]
     return count, weak_freq_list
+
+
+def run_multi_simulation(win_rates, team_names=None, regions=None, n=BATCH_RUNS):
+    return _aggregate_multi(run_single_simulation, win_rates, team_names, regions, n)
+
+
+def run_multi_group_simulation(win_rates, team_names=None, regions=None, n=BATCH_RUNS):
+    return _aggregate_multi(run_single_group_simulation, win_rates, team_names, regions, n)
+
 
 @csrf_exempt
 def simulate(request):
@@ -191,6 +277,7 @@ def simulate(request):
         data = json.loads(request.body)
         win_rates = data.get('win_rates')
         mode = data.get('mode')
+        tournament_format = data.get('tournament_format', 'swiss')
         team_names = data.get('team_names', [str(i) for i in range(1, 17)])
         regions = data.get('regions', list(range(1, 17)))
     except Exception as e:
@@ -200,16 +287,38 @@ def simulate(request):
         return JsonResponse({'error': 'Win rates must be 16x16'}, status=400)
     if len(team_names) != 16 or len(regions) != 16:
         return JsonResponse({'error': 'team_names and regions must be length 16'}, status=400)
+    if tournament_format not in ('swiss', 'group'):
+        return JsonResponse({'error': 'tournament_format must be swiss or group'}, status=400)
 
     for i in range(16):
         if win_rates[i][i] != 0:
             return JsonResponse({'error': 'Diagonal must be 0'}, status=400)
 
     if mode == 'single':
-        result = run_single_simulation(win_rates, team_names, regions)
-        return JsonResponse({'type': 'single', 'result': result})
+        if tournament_format == 'group':
+            result = run_single_group_simulation(win_rates, team_names, regions)
+        else:
+            result = run_single_simulation(win_rates, team_names, regions)
+        return JsonResponse({
+            'type': 'single',
+            'format': tournament_format,
+            'result': result,
+        })
     elif mode == 'multi':
-        stats, weak_freq = run_multi_simulation(win_rates, team_names, regions, n=10000)
-        return JsonResponse({'type': 'multi', 'stats': stats, 'weak_freq': weak_freq})
+        if tournament_format == 'group':
+            stats, weak_freq = run_multi_group_simulation(
+                win_rates, team_names, regions, n=BATCH_RUNS,
+            )
+        else:
+            stats, weak_freq = run_multi_simulation(
+                win_rates, team_names, regions, n=BATCH_RUNS,
+            )
+        return JsonResponse({
+            'type': 'multi',
+            'format': tournament_format,
+            'runs': BATCH_RUNS,
+            'stats': stats,
+            'weak_freq': weak_freq,
+        })
     else:
         return JsonResponse({'error': 'Invalid mode'}, status=400)

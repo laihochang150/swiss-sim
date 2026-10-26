@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>英雄联盟瑞士轮模拟器</title>
+    <title>英雄联盟赛事模拟器</title>
     <style>
         body { font-family: Arial; margin: 20px; }
         table { border-collapse: collapse; margin: 8px 0; }
@@ -15,7 +15,7 @@
     </style>
 </head>
 <body>
-    <h1>英雄联盟瑞士轮模拟器</h1>
+    <h1>英雄联盟赛事模拟器</h1>
 
     <!-- 队伍配置：3行17列表格 -->
     <table>
@@ -78,6 +78,13 @@
     </table>
 
     <br>
+    <label><strong>赛制：</strong>
+        <select id="tournament_format">
+            <option value="swiss">瑞士轮（16 队 / 5 轮）</option>
+            <option value="group">小组赛（4 组 × 4 队）</option>
+        </select>
+    </label>
+    <br><br>
     <button onclick="runSimulation('single')">进行一次模拟</button>
     <button onclick="runSimulation('multi')">进行10000次模拟</button>
 
@@ -146,6 +153,7 @@
             const winRates = getWinRates();
             const teamNames = getTeamNames();
             const regions = getRegions();
+            const tournamentFormat = document.getElementById('tournament_format').value;
             const output = document.getElementById('output');
             output.innerHTML = '模拟中...';
 
@@ -155,7 +163,7 @@
                     'Content-Type': 'application/json',
                     'X-CSRFToken': getCookie('csrftoken')
                 },
-                body: JSON.stringify({ win_rates: winRates, mode: mode, team_names: teamNames, regions: regions })
+                body: JSON.stringify({ win_rates: winRates, mode: mode, tournament_format: tournamentFormat, team_names: teamNames, regions: regions })
             })
             .then(res => res.json())
             .then(data => {
@@ -164,7 +172,23 @@
                     return;
                 }
 
-                if (data.type === 'single') {
+                if (data.type === 'single' && data.format === 'group') {
+                    let text = '=== 单次小组赛结果 ===\n\n';
+                    data.result.groups.forEach(g => {
+                        text += `====${g.group_name}====\n排名:\n`;
+                        g.standings.forEach(s => {
+                            text += `  ${s.rank}. ${s.name}  ${s.wins}-${s.losses}${s.qualified ? ' [晋级]' : ''}\n`;
+                        });
+                        text += '对局:\n';
+                        g.matches.forEach(m => {
+                            text += `  ${m.team1_name} vs ${m.team2_name} -> 胜者: ${m.winner_name}\n`;
+                        });
+                        text += '\n';
+                    });
+                    text += `晋级队伍: ${data.result.qualifiers.join(', ')}\n`;
+                    text += `弱队晋级数: ${data.result.weak_count}`;
+                    output.innerHTML = '<pre>' + text + '</pre>';
+                } else if (data.type === 'single') {
                     let text = '=== 单次模拟结果 ===\n\n';
                     data.result.rounds.forEach(r => {
                         text += `第 ${r.round} 轮:\n`;
@@ -182,15 +206,17 @@
                     text += `晋级队伍: ${data.result.qualifiers.join(', ')}`;
                     output.innerHTML = '<pre>' + text + '</pre>';
                 } else {
-                    let text = '=== 10000次模拟：各队伍晋级频次 ===\n';
+                    const runs = data.runs || 10000;
+                    const formatName = data.format === 'group' ? '小组赛' : '瑞士轮';
+                    let text = `=== ${runs}次${formatName}模拟：各队伍晋级频次 ===\n`;
                     data.stats.forEach((count, idx) => {
                         const name = teamNames[idx] || (idx + 1);
-                        const pct = (count / 10000 * 100).toFixed(2);
+                        const pct = (count / runs * 100).toFixed(2);
                         text += `${name}: ${count} 次 (${pct}%)\n`;
                     });
-                    text += '\n=== 10000次模拟：每场晋级中9~16号队伍数量分布 ===\n';
+                    text += `\n=== ${runs}次${formatName}模拟：晋级队伍中9~16号队伍数量分布 ===\n`;
                     data.weak_freq.forEach((freq, count) => {
-                        const pct = (freq / 10000 * 100).toFixed(2);
+                        const pct = (freq / runs * 100).toFixed(2);
                         text += `${count} 支弱队: ${freq} 次 (${pct}%)\n`;
                     });
                     output.innerHTML = '<pre>' + text + '</pre>';
